@@ -1129,3 +1129,121 @@ impl Display for FrontiersNotIncluded {
         f.write_str("The given Frontiers are not included by the doc")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arena::SharedArena;
+    use std::sync::atomic::AtomicI64;
+
+    /// Build a minimal AppDag by hand, bypassing handle_deps_break_points,
+    /// so that two dep IDs from different nodes resolve to the same unsplit
+    /// Arc<AppDagNodeInner>. This is the exact state that causes ensure_vv_for
+    /// to push the same Arc onto its DFS stack twice, leading to a double-set
+    /// panic on the OnceCell<ImVersionVector>.
+    ///
+    /// DAG shape:
+    ///
+    ///         D (peer 4, deps=[X:99, Y:99, Z:9])
+    ///        /|\
+    ///       / | \
+    ///    X:99 Y:99 Z:9
+    ///              |
+    ///         Z (peer 3, deps=[X:49, Y:49])
+    ///            / \
+    ///         X:49  Y:49
+    ///
+    /// X:[0,100) and Y:[0,100) are each stored as ONE unsplit node.
+    /// get(X:49) and get(X:99) return clones of the same Arc → same OnceCell.
+    /// The DFS in ensure_vv_for pushes X twice (once from D, once from Z),
+    /// and on the second pop tries to set the already-set VV.
+    #[test]
+    fn ensure_vv_for_double_set_on_unsplit_diamond() {
+        let peer_x: PeerID = 1;
+        let peer_y: PeerID = 2;
+        let peer_z: PeerID = 3;
+        let peer_d: PeerID = 4;
+
+        let arena = SharedArena::new();
+        let change_store =
+            super::super::ChangeStore::new_mem(&arena, Arc::new(AtomicI64::new(0)));
+        let mut dag = AppDag::new(change_store);
+
+        // X:[0,100) — one big unsplit node, root (empty deps).
+        let node_x = AppDagNode::new(AppDagNodeInner {
+            peer: peer_x,
+            cnt: 0,
+            lamport: 0,
+            deps: Frontiers::default(),
+            vv: OnceCell::new(),
+            has_succ: false,
+            len: 100,
+        });
+
+        // Y:[0,100) — one big unsplit node, root.
+        let node_y = AppDagNode::new(AppDagNodeInner {
+            peer: peer_y,
+            cnt: 0,
+            lamport: 0,
+            deps: Frontiers::default(),
+            vv: OnceCell::new(),
+            has_succ: false,
+            len: 100,
+        });
+
+        // Z:[0,10), deps on X:49 and Y:49 (pointing into the MIDDLE of unsplit X and Y).
+        let node_z = AppDagNode::new(AppDagNodeInner {
+            peer: peer_z,
+            cnt: 0,
+            lamport: 100,
+            deps: vec![ID::new(peer_x, 49), ID::new(peer_y, 49)].into(),
+            vv: OnceCell::new(),
+            has_succ: false,
+            len: 10,
+        });
+
+        // D:[0,1), deps on X:99, Y:99, Z:9.
+        // X:99 and X:49 resolve to the same unsplit node_x.
+        // Y:99 and Y:49 resolve to the same unsplit node_y.
+        let node_d = AppDagNode::new(AppDagNodeInner {
+            peer: peer_d,
+            cnt: 0,
+            lamport: 200,
+            deps: vec![
+                ID::new(peer_x, 99),
+                ID::new(peer_y, 99),
+                ID::new(peer_z, 9),
+            ]
+            .into(),
+            vv: OnceCell::new(),
+            has_succ: false,
+            len: 1,
+        });
+
+        // Insert nodes into the map directly (no splitting).
+        {
+            let mut map = dag.map.lock().unwrap();
+            map.insert(node_x.id_start(), node_x);
+            map.insert(node_y.id_start(), node_y);
+            map.insert(node_z.id_start(), node_z);
+            map.insert(node_d.id_start(), node_d.clone());
+        }
+
+        // Set the DAG's VV so it knows about all peers.
+        dag.vv.insert(peer_x, 100);
+        dag.vv.insert(peer_y, 100);
+        dag.vv.insert(peer_z, 10);
+        dag.vv.insert(peer_d, 1);
+
+        // This panics with "called `Result::unwrap()` on an `Err` value:
+        // ImVersionVector(...)" at line 916 because X and Y each get pushed
+        // to the stack twice (from D's deps and from Z's deps) but share the
+        // same OnceCell.
+        let vv = dag.ensure_vv_for(&node_d);
+
+        // After the fix (guard the set), the VV should be correct.
+        assert!(vv.get(&peer_x).copied().unwrap_or(0) >= 100);
+        assert!(vv.get(&peer_y).copied().unwrap_or(0) >= 100);
+        assert!(vv.get(&peer_z).copied().unwrap_or(0) >= 10);
+    }
+}

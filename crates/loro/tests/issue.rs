@@ -383,6 +383,242 @@ fn issue_924_fork_shallow_snapshot() {
     assert_eq!(doc_b.get_deep_value(), doc_c.get_deep_value());
 }
 
+/// Regression test for ensure_vv_for double-set panic (loro_dag.rs:916).
+///
+/// Reproduces the crash:
+///   panicked at crates/loro-internal/src/oplog/loro_dag.rs:916:49:
+///   called `Result::unwrap()` on an `Err` value: ImVersionVector(...)
+///
+/// The ensure_vv_for stack-based DFS can push the same Arc<AppDagNodeInner>
+/// twice when the DAG has a diamond pattern where a dep node appears in
+/// both the direct deps and the transitive deps of another dep.
+/// The second OnceCell::set() panics because the VV was already computed.
+///
+/// Pattern: D deps=[X_batch2, Y_batch2, Z], Z deps=[X_batch1, Y_batch1]
+/// where X_batch1 and X_batch2 are from the same peer (may be same node
+/// if not split), and similarly for Y.
+#[test]
+fn issue_ensure_vv_for_double_set_panic() {
+    // Three peers simulate calendar sync writers.
+    let peer_x: u64 = 5949460327480635965;
+    let peer_y: u64 = 453872192370119494;
+    let peer_z: u64 = 5949460327480677794;
+
+    // Peer X writes batch 1.
+    let doc_x = LoroDoc::new();
+    doc_x.set_peer_id(peer_x).unwrap();
+    let map_x = doc_x.get_map("events");
+    for i in 0..50 {
+        map_x
+            .insert(&format!("x1-{}", i), format!("X batch1 event {}", i))
+            .unwrap();
+    }
+    doc_x.commit();
+    let x_batch1 = doc_x.export(ExportMode::all_updates()).unwrap();
+    let x_batch1_vv = doc_x.oplog_vv();
+
+    // Peer Y writes batch 1.
+    let doc_y = LoroDoc::new();
+    doc_y.set_peer_id(peer_y).unwrap();
+    let map_y = doc_y.get_map("events");
+    for i in 0..50 {
+        map_y
+            .insert(&format!("y1-{}", i), format!("Y batch1 event {}", i))
+            .unwrap();
+    }
+    doc_y.commit();
+    let y_batch1 = doc_y.export(ExportMode::all_updates()).unwrap();
+    let y_batch1_vv = doc_y.oplog_vv();
+
+    // Peer Z imports X_batch1 + Y_batch1, then writes.
+    // Z now depends on both X_batch1_last and Y_batch1_last.
+    let doc_z = LoroDoc::new();
+    doc_z.set_peer_id(peer_z).unwrap();
+    doc_z.import(&x_batch1).unwrap();
+    doc_z.import(&y_batch1).unwrap();
+    let map_z = doc_z.get_map("events");
+    for i in 0..10 {
+        map_z
+            .insert(&format!("z-{}", i), format!("Z event {}", i))
+            .unwrap();
+    }
+    doc_z.commit();
+    let z_updates = doc_z.export(ExportMode::all_updates()).unwrap();
+
+    // Peer X writes batch 2 (doesn't know about Z).
+    for i in 0..50 {
+        map_x
+            .insert(&format!("x2-{}", i), format!("X batch2 event {}", i))
+            .unwrap();
+    }
+    doc_x.commit();
+    let x_batch2 = doc_x
+        .export(ExportMode::updates_owned(x_batch1_vv))
+        .unwrap();
+
+    // Peer Y writes batch 2 (doesn't know about Z).
+    for i in 0..50 {
+        map_y
+            .insert(&format!("y2-{}", i), format!("Y batch2 event {}", i))
+            .unwrap();
+    }
+    doc_y.commit();
+    let y_batch2 = doc_y
+        .export(ExportMode::updates_owned(y_batch1_vv))
+        .unwrap();
+
+    // Merge everything into one document.
+    // After merge: frontiers = [X_batch2_last, Y_batch2_last, Z_last]
+    // because Z only depends on batch1 of both X and Y.
+    let merged = LoroDoc::new();
+    merged.import(&x_batch1).unwrap();
+    merged.import(&x_batch2).unwrap();
+    merged.import(&y_batch1).unwrap();
+    merged.import(&y_batch2).unwrap();
+    merged.import(&z_updates).unwrap();
+
+    let old_frontiers = merged.oplog_frontiers();
+    assert!(
+        old_frontiers.len() >= 3,
+        "should have 3+ frontier entries (X_batch2, Y_batch2, Z), got {}",
+        old_frontiers.len()
+    );
+
+    // New peer writes on the merged doc, creating a commit that depends
+    // on all 3 frontiers. This is the node that triggers ensure_vv_for
+    // with the problematic diamond pattern.
+    merged.set_peer_id(12345).unwrap();
+    merged
+        .get_map("events")
+        .insert("merged-event", "merged")
+        .unwrap();
+    merged.commit();
+    let new_frontiers = merged.oplog_frontiers();
+
+    // Export snapshot. Reload to force lazy DAG node loading.
+    let snapshot = merged.export(ExportMode::Snapshot).unwrap();
+    let reloaded = LoroDoc::new();
+    reloaded.import(&snapshot).unwrap();
+
+    // Free caches to clear any precomputed VVs.
+    reloaded.free_diff_calculator();
+    reloaded.free_history_cache();
+
+    // This Diff call triggers ensure_vv_for on the lazily-loaded DAG.
+    // With the diamond pattern (Z deps on X_batch1 and Y_batch1, while
+    // the merge commit deps on X_batch2, Y_batch2, and Z), the DFS may
+    // push the same node twice, causing the OnceCell double-set panic.
+    let result = reloaded.diff(&old_frontiers, &new_frontiers);
+    assert!(
+        result.is_ok(),
+        "diff should not panic: {:?}",
+        result.err()
+    );
+}
+
+/// Diff with old frontiers before shallow root should return an error, not panic.
+#[test]
+fn issue_diff_shallow_snapshot_should_not_panic() {
+    let peer_x: u64 = 5949460327480635965;
+    let peer_y: u64 = 453872192370119494;
+    let peer_z: u64 = 5949460327480677794;
+
+    let doc_x = LoroDoc::new();
+    doc_x.set_peer_id(peer_x).unwrap();
+    for i in 0..100 {
+        doc_x
+            .get_map("events")
+            .insert(&format!("x1-{}", i), format!("X1 {}", i))
+            .unwrap();
+    }
+    doc_x.commit();
+    let x_batch1 = doc_x.export(ExportMode::all_updates()).unwrap();
+    let x_b1_vv = doc_x.oplog_vv();
+
+    let doc_y = LoroDoc::new();
+    doc_y.set_peer_id(peer_y).unwrap();
+    for i in 0..100 {
+        doc_y
+            .get_map("events")
+            .insert(&format!("y1-{}", i), format!("Y1 {}", i))
+            .unwrap();
+    }
+    doc_y.commit();
+    let y_batch1 = doc_y.export(ExportMode::all_updates()).unwrap();
+    let y_b1_vv = doc_y.oplog_vv();
+
+    // Z imports both batch1s.
+    let doc_z = LoroDoc::new();
+    doc_z.set_peer_id(peer_z).unwrap();
+    doc_z.import(&x_batch1).unwrap();
+    doc_z.import(&y_batch1).unwrap();
+    for i in 0..20 {
+        doc_z
+            .get_map("events")
+            .insert(&format!("z-{}", i), format!("Z {}", i))
+            .unwrap();
+    }
+    doc_z.commit();
+    let z_updates = doc_z.export(ExportMode::all_updates()).unwrap();
+
+    // X and Y write more (batch2).
+    for i in 0..100 {
+        doc_x
+            .get_map("events")
+            .insert(&format!("x2-{}", i), format!("X2 {}", i))
+            .unwrap();
+    }
+    doc_x.commit();
+    let x_batch2 = doc_x.export(ExportMode::updates_owned(x_b1_vv)).unwrap();
+
+    for i in 0..100 {
+        doc_y
+            .get_map("events")
+            .insert(&format!("y2-{}", i), format!("Y2 {}", i))
+            .unwrap();
+    }
+    doc_y.commit();
+    let y_batch2 = doc_y.export(ExportMode::updates_owned(y_b1_vv)).unwrap();
+
+    // Merge all.
+    let merged = LoroDoc::new();
+    merged.import(&x_batch1).unwrap();
+    merged.import(&x_batch2).unwrap();
+    merged.import(&y_batch1).unwrap();
+    merged.import(&y_batch2).unwrap();
+    merged.import(&z_updates).unwrap();
+
+    let old_frontiers = merged.oplog_frontiers();
+
+    // Merge commit.
+    merged.set_peer_id(99999).unwrap();
+    merged
+        .get_map("events")
+        .insert("final", "done")
+        .unwrap();
+    merged.commit();
+    let new_frontiers = merged.oplog_frontiers();
+
+    // Export as shallow snapshot at current frontiers.
+    let shallow = merged
+        .export(ExportMode::shallow_snapshot(&merged.oplog_frontiers()))
+        .unwrap();
+    let reloaded = LoroDoc::new();
+    reloaded.import(&shallow).unwrap();
+
+    // Old frontiers predate the shallow root — Diff should return Err, not panic.
+    let result = reloaded.diff(&old_frontiers, &new_frontiers);
+    assert!(
+        result.is_err(),
+        "diff with pre-shallow frontiers should return error, not panic"
+    );
+
+    // Diff between post-shallow frontiers should work fine.
+    let post_shallow_old = reloaded.oplog_frontiers();
+    let result2 = reloaded.diff(&post_shallow_old, &new_frontiers);
+    assert!(result2.is_ok(), "diff with valid post-shallow frontiers should work");
+}
+
 #[test]
 fn get_unknown_cursor_position_but_its_in_pending() {
     let doc_0 = LoroDoc::new();
