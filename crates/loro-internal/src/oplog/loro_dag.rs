@@ -913,7 +913,13 @@ impl AppDag {
                 }
 
                 // trace!("ans_vv={:?}", &ans_vv);
-                top_node.vv.set(ans_vv.clone()).unwrap();
+                // Guard against double-set: when a diamond DAG has unsplit nodes,
+                // the same Arc<AppDagNodeInner> can be pushed to the stack twice
+                // by different parent nodes. The first pop computes and sets the VV;
+                // the second pop must skip the already-set OnceCell.
+                if top_node.vv.get().is_none() {
+                    top_node.vv.set(ans_vv).unwrap();
+                }
             }
         }
 
