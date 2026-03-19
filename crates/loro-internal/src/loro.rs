@@ -1018,6 +1018,14 @@ impl LoroDoc {
                     return Err(LoroError::FrontiersNotFound(id));
                 }
             }
+            // Reject frontiers that predate the shallow root — the internal
+            // checkout would panic with SwitchToVersionBeforeShallowRoot.
+            if oplog.dag.is_before_shallow_root(a) {
+                return Err(LoroError::SwitchToVersionBeforeShallowRoot);
+            }
+            if oplog.dag.is_before_shallow_root(b) {
+                return Err(LoroError::SwitchToVersionBeforeShallowRoot);
+            }
         }
 
         let (options, txn) = self.implicit_commit_then_stop();
