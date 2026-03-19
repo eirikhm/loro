@@ -1,8 +1,8 @@
 #![allow(deprecated)]
 #![allow(unexpected_cfgs)]
 use loro::{
-    cursor::Cursor, ContainerID, ContainerTrait, EncodedBlobMode, ExportMode, LoroDoc, LoroList,
-    LoroText, UndoManager,
+    cursor::Cursor, ContainerID, ContainerTrait, EncodedBlobMode, ExportMode, LoroDoc,
+    LoroList, LoroText, UndoManager,
 };
 use std::sync::{Arc, Mutex};
 use tracing::{trace, trace_span};
