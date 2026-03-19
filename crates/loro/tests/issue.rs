@@ -1,8 +1,8 @@
 #![allow(deprecated)]
 #![allow(unexpected_cfgs)]
 use loro::{
-    cursor::Cursor, ContainerID, ContainerTrait, EncodedBlobMode, ExportMode, LoroDoc, LoroList,
-    LoroText, UndoManager,
+    cursor::Cursor, ContainerID, ContainerTrait, EncodedBlobMode, ExportMode, LoroDoc,
+    LoroList, LoroText, UndoManager,
 };
 use std::sync::{Arc, Mutex};
 use tracing::{trace, trace_span};
@@ -381,6 +381,49 @@ fn issue_924_fork_shallow_snapshot() {
     let doc_c = doc_b.fork();
     assert!(doc_c.is_shallow());
     assert_eq!(doc_b.get_deep_value(), doc_c.get_deep_value());
+}
+
+/// diff() panics on shallow docs when old frontiers predate the shallow root.
+///
+/// The bug: diff() validates that frontier IDs exist in the DAG via
+/// dag.contains(), but doesn't check is_before_shallow_root(). The
+/// subsequent _checkout_without_emitting().unwrap() at loro.rs:1032
+/// panics with SwitchToVersionBeforeShallowRoot.
+#[test]
+fn issue_diff_shallow_snapshot_should_not_panic() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    doc.get_text("t").insert(0, "hello").unwrap();
+    doc.commit();
+    let pre_shallow_frontiers = doc.oplog_frontiers();
+
+    doc.get_text("t").insert(5, " world").unwrap();
+    doc.commit();
+    let current_frontiers = doc.oplog_frontiers();
+
+    // Export shallow snapshot at current version — history before it is pruned.
+    let shallow = doc
+        .export(ExportMode::shallow_snapshot(&current_frontiers))
+        .unwrap();
+    let shallow_doc = LoroDoc::new();
+    shallow_doc.import(&shallow).unwrap();
+    assert!(shallow_doc.is_shallow());
+
+    // pre_shallow_frontiers predate the shallow root.
+    // diff() should return Err, not panic.
+    let result = shallow_doc.diff(&pre_shallow_frontiers, &current_frontiers);
+    assert!(
+        result.is_err(),
+        "diff with pre-shallow frontiers should return error, not panic"
+    );
+
+    // Diff between post-shallow frontiers should still work.
+    let post_shallow = shallow_doc.oplog_frontiers();
+    let result2 = shallow_doc.diff(&post_shallow, &current_frontiers);
+    assert!(
+        result2.is_ok(),
+        "diff with valid post-shallow frontiers should work"
+    );
 }
 
 #[test]
