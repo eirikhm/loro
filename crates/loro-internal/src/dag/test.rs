@@ -1465,3 +1465,315 @@ fn failed_fuzz() {
 //         }
 //     }
 // }
+
+/// Tests for the DagCausalIter node-splitting race condition.
+///
+/// In production, `AppDag::get()` triggers `ensure_lazy_load_node()` which can
+/// call `handle_deps_break_points()` to split existing nodes when a newly-loaded
+/// peer's changes depend on the middle of another peer's node. This mutation
+/// happens via interior mutability (Mutex<BTreeMap>) during iteration.
+///
+/// `TestDag` never splits nodes, so it can't reproduce the bug. `SplittingDag`
+/// simulates this behavior: after a configurable number of `get()` calls, it
+/// splits a specified node into two halves — exactly what `AppDag` does when
+/// lazy loading triggers `handle_deps_break_points`.
+mod splitting_dag {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+    use crate::dag::{iter::DagCausalIter, Dag, DagNode};
+
+    /// A Dag wrapper that splits a node after the first get() for the split
+    /// peer returns, simulating the lazy-load node-splitting behavior of AppDag.
+    ///
+    /// In production, `AppDag::get(ID(peer_1, 0))` triggers lazy loading which
+    /// calls `handle_deps_break_points()` and splits peer_0's node. The key
+    /// property is that `get(ID(peer_0, 0))` returns the unsplit node, and then
+    /// a later `get()` (for any peer) triggers the split. All subsequent calls
+    /// to `get(ID(peer_0, X))` return the split (smaller) node.
+    ///
+    /// This wrapper reproduces that behavior deterministically:
+    /// 1. The first `get()` for the split peer returns the unsplit node
+    /// 2. The next `get()` call (for any peer) triggers the split
+    /// 3. All subsequent `get()` calls for the split peer return the split node
+    #[derive(Debug)]
+    struct SplittingDag {
+        inner: RefCell<TestDag>,
+        /// (peer, split_counter): split the node containing this counter
+        split_at: (PeerID, Counter),
+        /// Whether we've returned the unsplit node for the split peer
+        seen_split_peer_unsplit: Cell<bool>,
+        /// Whether the split has been performed
+        has_split: Cell<bool>,
+    }
+
+    impl SplittingDag {
+        fn new(dag: TestDag, split_peer: PeerID, split_counter: Counter) -> Self {
+            Self {
+                inner: RefCell::new(dag),
+                split_at: (split_peer, split_counter),
+                seen_split_peer_unsplit: Cell::new(false),
+                has_split: Cell::new(false),
+            }
+        }
+
+        /// Split the node containing split_counter into two nodes.
+        fn do_split(&self) {
+            let mut dag = self.inner.borrow_mut();
+            let (peer, split_counter) = self.split_at;
+            let arr = dag.nodes.get_mut(&peer).unwrap();
+
+            let idx = arr
+                .iter()
+                .position(|n| {
+                    n.id.counter <= split_counter
+                        && n.id.counter + n.len as Counter > split_counter
+                })
+                .expect("split_counter not found in any node");
+
+            let node = &arr[idx];
+            let offset = (split_counter - node.id.counter + 1) as usize;
+
+            if offset > 0 && offset < node.len {
+                let second = node.slice(offset, node.len);
+                let mut first = node.clone();
+                first.len = offset;
+                arr[idx] = first;
+                arr.insert(idx + 1, second);
+            }
+
+            self.has_split.set(true);
+        }
+    }
+
+    impl Dag for SplittingDag {
+        type Node = TestNode;
+
+        fn get(&self, id: ID) -> Option<Self::Node> {
+            let (split_peer, _) = self.split_at;
+
+            if id.peer == split_peer && !self.seen_split_peer_unsplit.get() {
+                // First access to the split peer: return the unsplit node.
+                // This simulates new()'s first get() for this peer seeing
+                // the large unsplit node before any lazy loading happens.
+                self.seen_split_peer_unsplit.set(true);
+                return self.inner.borrow().get(id);
+            }
+
+            // Any get() after we've returned the unsplit node triggers the
+            // split (if not already done). This simulates a get() for a
+            // different peer causing handle_deps_break_points to split the
+            // first peer's node.
+            if self.seen_split_peer_unsplit.get() && !self.has_split.get() {
+                self.do_split();
+            }
+
+            self.inner.borrow().get(id)
+        }
+
+        fn frontier(&self) -> &Frontiers {
+            // Safety: the inner TestDag outlives self, and we only need a
+            // shared reference that the RefCell would also provide.
+            unsafe { &(*self.inner.as_ptr()).frontier }
+        }
+
+        fn vv(&self) -> &VersionVector {
+            unsafe { &(*self.inner.as_ptr()).version_vec }
+        }
+
+        fn contains(&self, id: ID) -> bool {
+            self.inner.borrow().contains(id)
+        }
+    }
+
+    /// Reproduce the production panic: DagCausalIter::new() sees an unsplit
+    /// node and queues only one entry for a peer, but a later get() during
+    /// new() triggers a split. Then next() sees the smaller node.
+    ///
+    /// DAG topology:
+    ///   Peer 0: node [0, 10) — a single large node, no deps
+    ///   Peer 1: node [0, 1)  — depends on ID(0, 4)
+    ///
+    /// Target: peer 0 = [0, 7), peer 1 = [0, 1)
+    ///
+    /// Without splitting: new() sees [0, 10) for peer 0, queues one node.
+    /// next() processes [0, 10), slices to [0, 7), advances target past 7. OK.
+    ///
+    /// With splitting at counter 4 (triggered during new()'s get for peer 1):
+    /// The node [0, 10) is split into [0, 5) and [5, 10).
+    /// But new() already decided there's only one node for peer 0.
+    /// next() gets [0, 5) instead of [0, 10), processes it, advances target
+    /// to [5, 7). But no more peer 0 nodes are queued — the range [5, 7) is
+    /// orphaned and the iterator produces incomplete results.
+    ///
+    /// In debug mode this panics at the debug_assert_eq at iter.rs:277.
+    /// In release mode (production) the debug_assert is compiled out and the
+    /// code reaches the hard assert!(slice_end > slice_from) at iter.rs:299.
+    ///
+    /// When the fix is applied: remove #[should_panic] and the test should pass
+    /// with peer0_ops == 7.
+    #[test]
+    #[should_panic(expected = "assertion")]
+    fn test_split_during_iter_causes_incomplete_traversal() {
+        // Build the base TestDag with the topology described above.
+        let mut dag = TestDag::new(0);
+
+        // Peer 0: single large node [0, 10), no deps
+        dag.nodes
+            .entry(0)
+            .or_default()
+            .push(TestNode::new(ID::new(0, 0), 0, Frontiers::default(), 10));
+        dag.version_vec.insert(0, 10);
+        dag.frontier = Frontiers::from_id(ID::new(0, 9));
+        dag.next_lamport = 10;
+
+        // Peer 1: node [0, 1), depends on ID(0, 4)
+        dag.nodes.entry(1).or_default().push(TestNode::new(
+            ID::new(1, 0),
+            10,
+            ID::new(0, 4).into(),
+            1,
+        ));
+        dag.version_vec.insert(1, 1);
+        dag.frontier = Frontiers::from_id(ID::new(1, 0));
+        dag.next_lamport = 11;
+
+        // Create the splitting wrapper: split peer 0's node at counter 4
+        // after 2 get() calls (first get is for peer 0 in new(), second get
+        // triggers the split simulating peer 1's lazy load)
+        let splitting_dag = SplittingDag::new(dag, 0, 4);
+
+        // Target: peer 0 = [0, 7), peer 1 = [0, 1)
+        let mut target: IdSpanVector = Default::default();
+        target.insert(0, CounterSpan { start: 0, end: 7 });
+        target.insert(1, CounterSpan { start: 0, end: 1 });
+
+        let from = Frontiers::default();
+        let iter = DagCausalIter::new(&splitting_dag, from, target);
+
+        // Collect all items from the iterator
+        let items: Vec<_> = iter.collect();
+
+        // Verify the split happened
+        assert!(
+            splitting_dag.has_split.get(),
+            "split should have been triggered"
+        );
+
+        // Count how many ops were returned for peer 0
+        let peer0_ops: i32 = items
+            .iter()
+            .filter(|item| item.data.id_start().peer == 0)
+            .map(|item| (item.slice.end - item.slice.start))
+            .sum();
+
+        // BUG: with the split, peer 0 only returns 5 ops (from the [0,5) half)
+        // instead of the expected 7 ops (the full target [0,7)).
+        //
+        // In debug mode, the iterator panics at the debug_assert_eq! at
+        // iter.rs:277 when it detects node_id.counter != target_span.min().
+        // In release mode (production), the debug_assert is compiled out and
+        // the code reaches the hard assert!(slice_end > slice_from) at
+        // iter.rs:299 — the exact production crash.
+        //
+        // Once the fix is applied, change this to assert_eq!(peer0_ops, 7).
+        assert_eq!(
+            peer0_ops, 7,
+            "peer 0 should return 7 ops for target [0, 7), \
+             but got {peer0_ops} due to node splitting during iteration"
+        );
+    }
+
+    /// Same scenario but the target exactly matches the split boundary.
+    #[test]
+    fn test_split_target_matches_split_boundary() {
+        let mut dag = TestDag::new(0);
+
+        // Peer 0: single node [0, 10)
+        dag.nodes
+            .entry(0)
+            .or_default()
+            .push(TestNode::new(ID::new(0, 0), 0, Frontiers::default(), 10));
+        dag.version_vec.insert(0, 10);
+        dag.frontier = Frontiers::from_id(ID::new(0, 9));
+        dag.next_lamport = 10;
+
+        // Peer 1: node [0, 1), depends on ID(0, 4)
+        dag.nodes.entry(1).or_default().push(TestNode::new(
+            ID::new(1, 0),
+            10,
+            ID::new(0, 4).into(),
+            1,
+        ));
+        dag.version_vec.insert(1, 1);
+        dag.frontier = Frontiers::from_id(ID::new(1, 0));
+        dag.next_lamport = 11;
+
+        // Split at counter 4, target peer 0 = [0, 5) — exactly the split boundary
+        let splitting_dag = SplittingDag::new(dag, 0, 4);
+
+        let mut target: IdSpanVector = Default::default();
+        target.insert(0, CounterSpan { start: 0, end: 5 });
+        target.insert(1, CounterSpan { start: 0, end: 1 });
+
+        let from = Frontiers::default();
+        let iter = DagCausalIter::new(&splitting_dag, from, target);
+
+        let items: Vec<_> = iter.collect();
+
+        let peer0_ops: i32 = items
+            .iter()
+            .filter(|item| item.data.id_start().peer == 0)
+            .map(|item| (item.slice.end - item.slice.start))
+            .sum();
+
+        // Target [0, 5) matches the split node [0, 5) exactly — should work
+        assert_eq!(peer0_ops, 5, "peer 0 should return 5 ops for target [0, 5)");
+    }
+
+    /// Baseline: without splitting, the iterator works correctly with the same
+    /// DAG topology.
+    #[test]
+    fn test_no_split_baseline() {
+        let mut dag = TestDag::new(0);
+
+        // Peer 0: single node [0, 10)
+        dag.nodes
+            .entry(0)
+            .or_default()
+            .push(TestNode::new(ID::new(0, 0), 0, Frontiers::default(), 10));
+        dag.version_vec.insert(0, 10);
+        dag.frontier = Frontiers::from_id(ID::new(0, 9));
+        dag.next_lamport = 10;
+
+        // Peer 1: node [0, 1), depends on ID(0, 4)
+        dag.nodes.entry(1).or_default().push(TestNode::new(
+            ID::new(1, 0),
+            10,
+            ID::new(0, 4).into(),
+            1,
+        ));
+        dag.version_vec.insert(1, 1);
+        dag.frontier = Frontiers::from_id(ID::new(1, 0));
+        dag.next_lamport = 11;
+
+        // Target: peer 0 = [0, 7), peer 1 = [0, 1)
+        let mut target: IdSpanVector = Default::default();
+        target.insert(0, CounterSpan { start: 0, end: 7 });
+        target.insert(1, CounterSpan { start: 0, end: 1 });
+
+        let from = Frontiers::default();
+
+        // Use plain TestDag — no splitting
+        let iter = dag.iter_causal(from, target);
+        let items: Vec<_> = iter.collect();
+
+        let peer0_ops: i32 = items
+            .iter()
+            .filter(|item| item.data.id_start().peer == 0)
+            .map(|item| (item.slice.end - item.slice.start))
+            .sum();
+
+        assert_eq!(peer0_ops, 7, "without splitting, peer 0 should return 7 ops");
+    }
+}
