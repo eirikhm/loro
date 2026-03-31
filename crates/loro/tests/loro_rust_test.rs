@@ -3611,3 +3611,263 @@ fn has_container_test() {
     assert!(doc.has_container(&text.id()));
     assert!(doc.has_container(&list.id()));
 }
+
+/// Regression test for a panic in DagCausalIter::next() at dag/iter.rs:299
+/// (`assertion failed: slice_end > slice_from`).
+///
+/// The production crash occurred during peer-to-peer sync when importing
+/// incremental updates. The root cause is that lazy loading of one peer's DAG
+/// nodes can split another peer's nodes (via handle_deps_break_points) between
+/// the DagCausalIter::new() and DagCausalIter::next() calls, causing the
+/// iterator to see a different (smaller) node than what was used to determine
+/// how many nodes to queue for that peer.
+///
+/// This test exercises the exact production pattern: multiple LoroDoc instances
+/// doing concurrent edits on the same containers, syncing via incremental
+/// updates (ExportMode::updates), with interleaved partial syncs that create
+/// complex DAG topologies with cross-peer dependencies.
+#[test]
+#[parallel]
+fn test_concurrent_sync_dag_causal_iter_panic() {
+    // Simulate 3 peers doing concurrent edits (like platform pods syncing)
+    let doc_a = LoroDoc::new();
+    let doc_b = LoroDoc::new();
+    let doc_c = LoroDoc::new();
+
+    // Phase 1: All three peers make independent edits
+    let text_a = doc_a.get_text("text");
+    text_a.insert(0, "Hello from A").unwrap();
+    doc_a.commit();
+
+    let text_b = doc_b.get_text("text");
+    text_b.insert(0, "Hello from B").unwrap();
+    doc_b.commit();
+
+    let text_c = doc_c.get_text("text");
+    text_c.insert(0, "Hello from C").unwrap();
+    doc_c.commit();
+
+    // Phase 2: Partial sync — A imports B's changes (creates cross-peer deps)
+    let updates_b = doc_b.export(ExportMode::updates(&doc_a.oplog_vv())).unwrap();
+    doc_a.import(&updates_b).unwrap();
+
+    // Phase 3: A makes more edits (these depend on both A and B's ops)
+    let text_a = doc_a.get_text("text");
+    text_a.insert(0, "After merge: ").unwrap();
+    doc_a.commit();
+
+    // Phase 4: C imports A's full state (includes ops from A and B, with
+    // cross-peer dependencies that may trigger DAG node splitting during lazy load)
+    let updates_a = doc_a.export(ExportMode::updates(&doc_c.oplog_vv())).unwrap();
+    doc_c.import(&updates_a).unwrap();
+
+    // Phase 5: More concurrent edits
+    let text_a = doc_a.get_text("text");
+    text_a.insert(0, "X").unwrap();
+    doc_a.commit();
+
+    let text_c = doc_c.get_text("text");
+    text_c.insert(0, "Y").unwrap();
+    doc_c.commit();
+
+    // Phase 6: Bidirectional sync between A and C
+    // This is the critical step — importing incremental updates with complex
+    // DAG topology (3 peers, cross-deps, partial sync history)
+    let updates_c = doc_c.export(ExportMode::updates(&doc_a.oplog_vv())).unwrap();
+    let updates_a2 = doc_a.export(ExportMode::updates(&doc_c.oplog_vv())).unwrap();
+    doc_a.import(&updates_c).unwrap();
+    doc_c.import(&updates_a2).unwrap();
+
+    // Verify convergence
+    assert_eq!(doc_a.get_deep_value(), doc_c.get_deep_value());
+
+    // Phase 7: Full sync to B (which has been offline)
+    let updates_for_b = doc_a.export(ExportMode::updates(&doc_b.oplog_vv())).unwrap();
+    doc_b.import(&updates_for_b).unwrap();
+    assert_eq!(doc_a.get_deep_value(), doc_b.get_deep_value());
+}
+
+/// Stress test for the DAG causal iterator with many peers and interleaved syncs.
+/// This tries to trigger the node-splitting race during lazy loading by creating
+/// many cross-peer dependencies through interleaved partial syncs.
+#[test]
+#[parallel]
+fn test_many_peers_interleaved_sync_dag_iter() {
+    let num_peers = 5;
+    let docs: Vec<LoroDoc> = (0..num_peers).map(|_| LoroDoc::new()).collect();
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+
+    // Run several rounds of: random edits → partial sync between random pair
+    for round in 0..20 {
+        // Random peer makes edits
+        let editor = rng.gen_range(0..num_peers);
+        let text = docs[editor].get_text("text");
+        let len = text.len_unicode();
+        let pos = if len > 0 { rng.gen_range(0..=len) } else { 0 };
+        text.insert(pos, &format!("r{round}p{editor} ")).unwrap();
+        docs[editor].commit();
+
+        // Partial sync: random peer imports from another random peer
+        let src = rng.gen_range(0..num_peers);
+        let dst = (src + rng.gen_range(1..num_peers)) % num_peers;
+        let updates = docs[src]
+            .export(ExportMode::updates(&docs[dst].oplog_vv()))
+            .unwrap();
+        docs[dst].import(&updates).unwrap();
+    }
+
+    // Final: sync all to peer 0
+    for i in 1..num_peers {
+        let updates = docs[i]
+            .export(ExportMode::updates(&docs[0].oplog_vv()))
+            .unwrap();
+        docs[0].import(&updates).unwrap();
+    }
+
+    // Sync peer 0's full state back to all others
+    for i in 1..num_peers {
+        let updates = docs[0]
+            .export(ExportMode::updates(&docs[i].oplog_vv()))
+            .unwrap();
+        docs[i].import(&updates).unwrap();
+        assert_eq!(
+            docs[0].get_deep_value(),
+            docs[i].get_deep_value(),
+            "peer {i} diverged after full sync"
+        );
+    }
+}
+
+/// Targeted test for shallow documents with concurrent sync.
+/// Shallow docs trim old history, which can create unusual DAG states
+/// that stress the causal iterator.
+#[test]
+#[parallel]
+fn test_shallow_doc_concurrent_sync_dag_iter() {
+    let doc_a = LoroDoc::new();
+    let text = doc_a.get_text("text");
+    // Create enough history to make shallow meaningful
+    for i in 0..20 {
+        text.insert(0, &format!("{i}")).unwrap();
+    }
+    doc_a.commit();
+
+    // Create a shallow snapshot from the middle
+    let shallow_bytes = doc_a
+        .export(ExportMode::shallow_snapshot_since(ID::new(
+            doc_a.peer_id(),
+            10,
+        )))
+        .unwrap();
+    let doc_b = LoroDoc::new();
+    doc_b.import(&shallow_bytes).unwrap();
+
+    // Both make concurrent edits on the shallow doc
+    let text_a = doc_a.get_text("text");
+    text_a.insert(0, "A-edit ").unwrap();
+    doc_a.commit();
+
+    let text_b = doc_b.get_text("text");
+    text_b.insert(0, "B-edit ").unwrap();
+    doc_b.commit();
+
+    // Export incremental updates from A and import into B
+    // This exercises the diff computation on a shallow doc with cross-peer deps
+    let vv_b = doc_b.oplog_vv();
+    let updates = doc_a.export(ExportMode::updates(&vv_b));
+    if let Ok(updates) = updates {
+        // Import may fail for shallow docs with outdated deps — that's OK,
+        // we're testing that it doesn't panic with the assertion
+        let _ = doc_b.import(&updates);
+    }
+}
+
+/// Fuzz-style test that tries many seeds to trigger the DAG causal iterator
+/// panic via lazy-load node splitting. The key is loading documents from
+/// snapshots (which makes the DAG lazy) and then importing incremental updates
+/// from concurrent peers — this is the path where ensure_lazy_load_node can
+/// split nodes between DagCausalIter::new() and ::next() calls.
+#[test]
+#[parallel]
+fn test_snapshot_then_concurrent_import_fuzz() {
+    for seed in 0..50 {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let num_peers = rng.gen_range(2..=5);
+        let ops_per_round = rng.gen_range(1..=10);
+        let num_rounds = rng.gen_range(5..=15);
+
+        // Create the "source of truth" documents
+        let docs: Vec<LoroDoc> = (0..num_peers).map(|_| LoroDoc::new()).collect();
+
+        // Build up some history with partial syncs
+        for _ in 0..num_rounds {
+            let editor = rng.gen_range(0..num_peers);
+            let text = docs[editor].get_text("text");
+            for _ in 0..ops_per_round {
+                let len = text.len_unicode();
+                let pos = if len > 0 { rng.gen_range(0..=len) } else { 0 };
+                text.insert(pos, "x").unwrap();
+            }
+            docs[editor].commit();
+
+            // Random partial sync
+            if rng.gen_bool(0.6) {
+                let src = rng.gen_range(0..num_peers);
+                let dst = (src + rng.gen_range(1..num_peers)) % num_peers;
+                let updates = docs[src]
+                    .export(ExportMode::updates(&docs[dst].oplog_vv()))
+                    .unwrap();
+                docs[dst].import(&updates).unwrap();
+            }
+        }
+
+        // Now: take snapshots and load them into fresh docs (making DAGs lazy)
+        let snapshots: Vec<Vec<u8>> = docs
+            .iter()
+            .map(|d| d.export(ExportMode::Snapshot).unwrap())
+            .collect();
+
+        let lazy_docs: Vec<LoroDoc> = snapshots
+            .iter()
+            .map(|s| {
+                let d = LoroDoc::new();
+                d.import(s).unwrap();
+                d
+            })
+            .collect();
+
+        // Make concurrent edits on the lazy docs
+        for i in 0..num_peers {
+            let text = lazy_docs[i].get_text("text");
+            let len = text.len_unicode();
+            let pos = if len > 0 { rng.gen_range(0..=len) } else { 0 };
+            text.insert(pos, &format!("lazy{i}")).unwrap();
+            lazy_docs[i].commit();
+        }
+
+        // Cross-sync all lazy docs — this triggers lazy loading + import
+        // which is the exact path where the panic occurs
+        for i in 0..num_peers {
+            for j in 0..num_peers {
+                if i == j {
+                    continue;
+                }
+                let updates = lazy_docs[i]
+                    .export(ExportMode::updates(&lazy_docs[j].oplog_vv()))
+                    .unwrap();
+                lazy_docs[j].import(&updates).unwrap();
+            }
+        }
+
+        // Verify convergence
+        let expected = lazy_docs[0].get_deep_value();
+        for (i, d) in lazy_docs.iter().enumerate().skip(1) {
+            assert_eq!(
+                expected,
+                d.get_deep_value(),
+                "seed={seed} peer {i} diverged"
+            );
+        }
+    }
+}
